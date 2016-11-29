@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"github.com/kardianos/osext"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	netcontext "golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 )
 
 func firstExistingFile(candidates []string) string {
@@ -226,6 +228,11 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 	},
 }
 
+var (
+	stdin io.WriteCloser
+	state *term.State
+)
+
 // Shared namespaces multiple containers suppurt
 // The runv supports pod-style shared namespaces currently.
 // (More fine grain shared namespaces style (docker/runc style) is under implementation)
@@ -240,13 +247,47 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 // * Any running container can exit in any arbitrary order, the runv-daemon and the VM are existed until the last container of the VM is existed
 
 func startContainer(context *cli.Context, container, address string, config *specs.Spec) int {
-	pid := os.Getpid()
+	s, err := createStdio()
+	defer func() {
+		if s.stdin != "" {
+			os.RemoveAll(filepath.Dir(s.stdin))
+		}
+	}()
+	if err != nil {
+		fmt.Sprintf("%v", err)
+		return -1
+	}
+	restoreAndCloseStdin := func() {
+		if state != nil {
+			term.RestoreTerminal(os.Stdin.Fd(), state)
+		}
+		if stdin != nil {
+			stdin.Close()
+		}
+	}
+	defer restoreAndCloseStdin()
+
+	if !context.Bool("detach") {
+		if config.Process.Terminal {
+			s, err := term.SetRawTerminal(os.Stdin.Fd())
+			if err != nil {
+				fmt.Printf("error %v\n", err)
+				return -1
+			}
+			state = s
+		}
+		if err := attachStdio(s); err != nil {
+			fmt.Printf("error %v\n", err)
+			return -1
+		}
+	}
+
 	r := &types.CreateContainerRequest{
 		Id:         container,
 		BundlePath: context.String("bundle"),
-		Stdin:      fmt.Sprintf("/proc/%d/fd/0", pid),
-		Stdout:     fmt.Sprintf("/proc/%d/fd/1", pid),
-		Stderr:     fmt.Sprintf("/proc/%d/fd/2", pid),
+		Stdin:      s.stdin,
+		Stdout:     s.stdout,
+		Stderr:     s.stderr,
 	}
 
 	c := getClient(address)
@@ -254,15 +295,6 @@ func startContainer(context *cli.Context, container, address string, config *spe
 	if _, err := c.CreateContainer(netcontext.Background(), r); err != nil {
 		fmt.Printf("error %v\n", err)
 		return -1
-	}
-	if config.Process.Terminal {
-		s, err := term.SetRawTerminal(os.Stdin.Fd())
-		if err != nil {
-			fmt.Printf("error %v\n", err)
-			return -1
-		}
-		defer term.RestoreTerminal(os.Stdin.Fd(), s)
-		monitorTtySize(c, container, "init")
 	}
 	var started bool
 	for e := range evChan {
@@ -296,6 +328,24 @@ func startContainer(context *cli.Context, container, address string, config *spe
 			fmt.Printf("create pid-file error %v\n", err)
 		}
 	}
+	if context.Bool("detach") {
+		return 0
+	}
+	go func() {
+		io.Copy(stdin, os.Stdin)
+		if _, err := c.UpdateProcess(netcontext.Background(), &types.UpdateProcessRequest{
+			Id:         container,
+			Pid:        "init",
+			CloseStdin: true,
+		}); err != nil {
+			fmt.Printf("error %v\n", err)
+			return
+		}
+		restoreAndCloseStdin()
+	}()
+	if config.Process.Terminal {
+		monitorTtySize(c, container, "init")
+	}
 	for e := range evChan {
 		if e.Type == "exit" && e.Pid == "init" {
 			return int(e.Status)
@@ -322,4 +372,52 @@ func createPidFile(path string, pid int) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+type stdio struct {
+	stdin  string
+	stdout string
+	stderr string
+}
+
+// createStdio creates fifo files to act stdin, stdout and stderr
+func createStdio() (s stdio, err error) {
+	tmp, err := ioutil.TempDir("", "runv-cli-")
+	if err != nil {
+		return s, err
+	}
+	// create fifo's for the process
+	for name, fd := range map[string]*string{
+		"stdin":  &s.stdin,
+		"stdout": &s.stdout,
+		"stderr": &s.stderr,
+	} {
+		path := filepath.Join(tmp, name)
+		if err := unix.Mkfifo(path, 0755); err != nil && !os.IsExist(err) {
+			return s, err
+		}
+		*fd = path
+	}
+	return s, nil
+}
+
+// attachStdio open fifo's created by createStdio(), and copy current
+// process's stdout and stderr to stdout fifo and stderr fifo.
+func attachStdio(s stdio) error {
+	stdinf, err := os.OpenFile(s.stdin, syscall.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	stdin = stdinf
+	stdoutf, err := os.OpenFile(s.stdout, syscall.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	go io.Copy(os.Stdout, stdoutf)
+	stderrf, err := os.OpenFile(s.stderr, syscall.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	go io.Copy(os.Stderr, stderrf)
+	return nil
 }
