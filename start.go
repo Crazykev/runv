@@ -19,6 +19,11 @@ import (
 	netcontext "golang.org/x/net/context"
 )
 
+const (
+	ocidContianerTypeAnnotationKey  = "ocid/container_type"
+	ocidInfraContainerAnnotationKey = "ocid/sandbox_name"
+)
+
 func firstExistingFile(candidates []string) string {
 	for _, file := range candidates {
 		if _, err := os.Stat(file); err == nil {
@@ -116,16 +121,17 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 					os.Exit(-1)
 				}
 				sharedContainer = ns.Path
-				_, err = os.Stat(filepath.Join(root, sharedContainer, stateJson))
-				if err != nil {
-					fmt.Printf("The container %s is not existing or not ready\n", sharedContainer)
+				if err = checkSharedContainer(root, sharedContainer); err != nil {
+					fmt.Printf("%v", err)
 					os.Exit(-1)
 				}
-				_, err = os.Stat(filepath.Join(root, sharedContainer, "namespace"))
-				if err != nil {
-					fmt.Printf("The container %s is not ready\n", sharedContainer)
-					os.Exit(-1)
-				}
+			}
+		}
+		if sharedContainer == "" && spec.Annotations[ocidContianerTypeAnnotationKey] == "container" {
+			sharedContainer = spec.Annotations[ocidInfraContainerAnnotationKey]
+			if err = checkSharedContainer(root, sharedContainer); err != nil {
+				fmt.Printf("%v", err)
+				os.Exit(-1)
 			}
 		}
 
@@ -330,4 +336,16 @@ func createPidFile(path string, pid int) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func checkSharedContainer(root, sharedContainer string) error {
+	_, err := os.Stat(filepath.Join(root, sharedContainer, stateJson))
+	if err != nil {
+		return fmt.Errorf("The container %s is not existing or not ready\n", sharedContainer)
+	}
+	_, err = os.Stat(filepath.Join(root, sharedContainer, "namespace"))
+	if err != nil {
+		return fmt.Errorf("The container %s is not ready\n", sharedContainer)
+	}
+	return nil
 }
