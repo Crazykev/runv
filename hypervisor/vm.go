@@ -481,6 +481,27 @@ func (vm *Vm) OnlineCpuMem() error {
 	return nil
 }
 
+func (vm *Vm) HyperstartExec(execId, cmd string, terminal bool, tty *TtyIO) error {
+	var command []string
+
+	if cmd == "" {
+		return fmt.Errorf("'exec' without command")
+	}
+
+	if err := json.Unmarshal([]byte(cmd), &command); err != nil {
+		return err
+	}
+
+	env := []string{
+		"/bin/",
+		"/sbin/",
+		"/usr/bin/",
+		"/usr/sbin/",
+	}
+
+	return vm.AddProcess(hyperstartapi.HYPERSTART_EXEC_CONTAINER, execId, terminal, command, env, "/", tty)
+}
+
 func (vm *Vm) Exec(container, execId, cmd string, terminal bool, tty *TtyIO) error {
 	var command []string
 
